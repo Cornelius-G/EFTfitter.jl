@@ -1,6 +1,12 @@
 export SumOfSmallestIntervals
 export SmallestInterval
 export HighestDensityRegion
+export DetCov
+export DetCovK
+export TrCov
+export Variance
+export SumOf2DIntervals
+export ProdOf2DIntervals
 
 export get_smallest_interval_edges
 
@@ -50,6 +56,15 @@ SumOfSmallestIntervals(p=0.9, bins=200)
     bins::T = 200
 end
 
+@with_kw struct SumOf2DIntervals{T} <: AbstractRankingCriterion
+    p::Float64 = 0.9
+    bins::T = 200
+end
+
+@with_kw struct ProdOf2DIntervals{T} <: AbstractRankingCriterion
+    p::Float64 = 0.9
+    bins::T = 200
+end
 
 
 """
@@ -75,6 +90,33 @@ HighestDensityRegion(keys::NTuple{2, Symbol}, p=0.9, bins=200)
     bins::T = 200
 end
 
+
+
+"""
+    struct DetCov <: AbstractRankingCriterion
+
+
+Constructors:
+
+```julia
+DetCov()
+```
+"""
+struct DetCov <: AbstractRankingCriterion
+end
+
+struct DetCovK <: AbstractRankingCriterion
+end
+
+
+struct TrCov <: AbstractRankingCriterion
+end
+
+
+struct Variance <: AbstractRankingCriterion
+    key::Symbol
+end
+
 """
     apply_criterion(criterion<:AbstractRankingCriterion, samples::DensitySampleVector)
     
@@ -90,12 +132,43 @@ function apply_criterion(criterion::SumOfSmallestIntervals, samples::DensitySamp
     return get_all_intervals(samples, criterion.p, bins=criterion.bins)
 end
 
+function apply_criterion(criterion::SumOf2DIntervals, samples::DensitySampleVector)
+    return get_all_2D_intervals(samples, criterion.p, bins=criterion.bins)
+end
+
+function apply_criterion(criterion::ProdOf2DIntervals, samples::DensitySampleVector)
+    return get_all_2D_intervals(samples, criterion.p, bins=criterion.bins)
+end
+
 function apply_criterion(criterion::SmallestInterval, samples::DensitySampleVector)
     return get_volume(samples, (criterion.key, ), criterion.p, bins=criterion.bins)
 end
 
 function apply_criterion(criterion::HighestDensityRegion, samples::DensitySampleVector)
     return get_volume(samples, criterion.keys, criterion.p, bins=criterion.bins)
+end
+
+function apply_criterion(criterion::DetCov, samples::DensitySampleVector)
+    c = cov(BAT.unshaped.(samples))
+    return det(c)
+end
+
+
+function apply_criterion(criterion::DetCovK, samples::DensitySampleVector)
+    c = cov(BAT.unshaped.(samples))
+    k = size(c)[1]
+    return det(c)^(1/k)
+end
+
+function apply_criterion(criterion::TrCov, samples::DensitySampleVector)
+    c = cov(BAT.unshaped.(samples))
+    return tr(c)
+end
+
+function apply_criterion(criterion::Variance, samples::DensitySampleVector)
+    idx = BAT.asindex(samples, criterion.key)
+    c = cov(BAT.unshaped.(samples))
+    return c[idx, idx]
 end
 
 #------------------------------------------------------------------
@@ -167,7 +240,25 @@ function get_all_intervals(samples, p; bins=200)
     sample_keys = BAT.all_active_names(BAT.varshape(samples))
 
     intervals = [get_volume(samples, (Meta.parse(k),), p, bins=bins) for k in sample_keys]
+    
     return intervals
+end
+
+function get_all_2D_intervals(samples, p; bins=200)
+    sample_keys = BAT.all_active_names(BAT.varshape(samples))
+    nparams = length(sample_keys)
+    N = Int(0.5*nparams*(nparams-1))
+    areas = zeros(N)
+    
+    ctr = 1
+    for i in 1:nparams
+        for j in (i+1):nparams
+            areas[ctr] = get_volume(samples, (Meta.parse(sample_keys[i]), Meta.parse(sample_keys[j])), p, bins=bins)
+            ctr += 1
+        end
+    end
+
+    return areas
 end
 
 

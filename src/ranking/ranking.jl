@@ -31,17 +31,19 @@ Keyword arguments:
 struct MeasurementRanks <: AbstractRanks
     names::Vector{Symbol}
     values::Vector{Float64}
+    weights::Vector{Float64}
     criterion::AbstractRankingCriterion
     
     function MeasurementRanks(
         names::Vector{Symbol}, 
-        values::Vector{<:Real}, 
+        values::Vector{<:Real},
         criterion::AbstractRankingCriterion;
         order::Symbol = :values,
         rev::Bool = false
     )
         sorted_names, sorted_values = sort_ranking_results(order, names, values, rev=rev)
-        return new(sorted_names, sorted_values, criterion)
+        sorted_weights = sorted_values/sum(sorted_values)
+        return new(sorted_names, sorted_values, sorted_weights, criterion)
     end
 end
 
@@ -75,17 +77,19 @@ Keyword arguments:
 struct UncertaintyRanks <: AbstractRanks
     names::Vector{Symbol}
     values::Vector{Float64}
+    weights::Vector{Float64}
     criterion::AbstractRankingCriterion
     
     function UncertaintyRanks(
         names::Vector{Symbol}, 
-        values::Vector{<:Real}, 
+        values::Vector{<:Real},
         criterion::AbstractRankingCriterion;
         order::Symbol = :values,
         rev::Bool = false
     )
         sorted_names, sorted_values = sort_ranking_results(order, names, values, rev=rev)
-        return new(sorted_names, sorted_values, criterion)
+        sorted_weights = sorted_values/sum(sorted_values)
+        return new(sorted_names, sorted_values, sorted_weights, criterion)
     end
 end
 
@@ -122,14 +126,59 @@ function rank_measurements(
 )
     @info "Begin ranking of measurements"
     original = criterion_value(criterion, model, sampling_algorithm=sampling_algorithm)
-
+    
     deactivated_models, measurement_keys = measurement_models(model)
     values = [criterion_value(criterion, m, sampling_algorithm=sampling_algorithm) for m in deactivated_models]
+    println("values: ", values)
 
-    relative_increase = calculate_ranks(original, values)
+    relative_increase = calculate_ranks(original, values, criterion)
 
     return MeasurementRanks(collect(measurement_keys), relative_increase, criterion, order=order, rev=rev)
 end
+
+
+function rank_measurements_multiple(
+    model::EFTfitterModel;
+    sampling_algorithm::BAT.AbstractSamplingAlgorithm = MCMCSampling(),
+    criterions = [SumOfSmallestIntervals(), SumOf2DIntervals()],
+    order = :none,
+    rev = true
+)
+    @info "Begin multiple rankings of measurements"
+    posterior = PosteriorDensity(EFTfitterDensity(model), model.parameters)
+    samples = BAT.bat_sample(posterior, sampling_algorithm).result
+    
+    originals = apply_criterion.(criterions, Ref(samples))
+    
+    deactivated_models, measurement_keys = measurement_models(model)
+    nm = length(deactivated_models)
+    nc = length(criterions)
+    
+    values = [Array{Any}(undef, nm) for i=1:nc]
+    
+    for i in 1:nm
+        posterior = PosteriorDensity(EFTfitterDensity(deactivated_models[i]), deactivated_models[i].parameters)
+        samples = BAT.bat_sample(posterior, sampling_algorithm).result
+    
+        for j in 1:nc
+            values[j][i] = apply_criterion(criterions[j], samples)
+        end
+    end
+    
+    
+    relative_increases = []
+    for i in 1:nc
+        push!(relative_increases,  calculate_ranks(originals[i], values[i], criterions[i]))
+    end
+    
+    mr = Array{MeasurementRanks}(undef, nc)
+    for i in 1:nc
+        mr[i] = MeasurementRanks(collect(measurement_keys), relative_increases[i], criterions[i], order=order, rev=rev)
+    end
+    
+    return mr
+end
+
 
 
 """
@@ -166,7 +215,7 @@ function rank_uncertainties(
 
     deactivated_models, uncertainty_keys = uncertainty_models(model)
     values = [criterion_value(criterion, m, sampling_algorithm=sampling_algorithm) for m in deactivated_models]
-    relative_decrease = -1*calculate_ranks(original, values)
+    relative_decrease = -1*calculate_ranks(original, values, criterion)
 
     return UncertaintyRanks(collect(uncertainty_keys), relative_decrease, criterion, order=order, rev=rev)
 end
@@ -192,7 +241,14 @@ function measurement_models(model::EFTfitterModel)
         meas[i] = deactivate_measurement(meas[i])
         meas_nt = namedtuple(measurement_keys, meas)
         models[i] = EFTfitterModel(model.parameters, meas_nt, model.correlations)
+        
+        covm = get_total_covariance(models[i])
+        if !isposdef(covm)
+            @warn "The covariance matrix $covm is not positive definite"
+        end
     end
+
+
 
     return models, measurement_keys
 end
@@ -257,14 +313,96 @@ function criterion_value(
     criterion_value = apply_criterion(criterion, samples)
 end
 
+#----- calculate ranks ---------------------------
+function calculate_ranks(
+    original_value::Real, 
+    values::AbstractArray{Any},#AbstractArray{<:Real},
+    criterion::Union{SmallestInterval, SumOfSmallestIntervals, HighestDensityRegion}
+    )
+    relative_increase = (values.-original_value)./original_value
+    
+    return relative_increase
+end
 
-function calculate_ranks(original_value::Real, values::AbstractArray{<:Real})
+function calculate_ranks(
+    original_value::Real, 
+    values::AbstractArray{<:Real},
+    criterion::Union{SmallestInterval, SumOfSmallestIntervals, HighestDensityRegion}
+    )
+    relative_increase = (values.-original_value)./original_value
+    
+    return relative_increase
+end
+
+function calculate_ranks(
+    original_value::Real, 
+    values::AbstractArray{Any},#AbstractArray{<:Real},
+    criterion::Union{DetCov, DetCovK, TrCov, Variance}
+    )
     return relative_increase = (values.-original_value)./original_value
 end
 
-function calculate_ranks(original_values::AbstractArray{<:Real}, values::AbstractArray{<:AbstractArray{<:Real, 1}, 1})
-    relative_increase = [sum((val.-original_values)./original_values) for val in values]
+function calculate_ranks(
+    original_value::Real, 
+    values::AbstractArray{<:Real},
+    criterion::Union{DetCov, DetCovK, TrCov, Variance}
+    )
+    return relative_increase = (values.-original_value)./original_value
 end
+
+# arrays
+function calculate_ranks(
+    original_values::AbstractArray{<:Real}, 
+    values::AbstractArray{<:AbstractArray{<:Real, 1}, 1},
+    criterion::Union{SmallestInterval, HighestDensityRegion}
+    )
+    relative_increase = [sum((val.-original_values)./original_values) for val in values]
+    
+    return relative_increase
+end
+
+function calculate_ranks(
+    original_values::AbstractArray{<:Real}, 
+    values::AbstractArray{<:AbstractArray{<:Real, 1}, 1},
+    criterion::Union{SumOfSmallestIntervals, SumOf2DIntervals}
+    )
+    relative_increase = [sum((val.-original_values)./(original_values)) for val in values]
+
+    return relative_increase
+end
+
+# any arrays
+function calculate_ranks(
+    original_values::AbstractArray{<:Real}, 
+    values::AbstractArray{Any},
+    criterion::Union{SumOfSmallestIntervals, SumOf2DIntervals, SmallestInterval, HighestDensityRegion}
+    )
+    relative_increase = [sum((val.-original_values)./(original_values)) for val in values]
+
+    return relative_increase
+end
+
+
+function calculate_ranks(
+    original_values::AbstractArray{<:Real}, 
+    values::AbstractArray{<:AbstractArray{<:Real, 1}, 1},#AbstractArray{Any},
+    criterion::ProdOf2DIntervals
+    )
+    
+    nmeas = length(values)
+    relative_increase = Float64[]
+    for i in 1:nmeas
+        p = prod(values[i])
+        op = prod(original_values)
+
+        r = (p-op)/op
+        push!(relative_increase, r)
+    end   
+
+    return relative_increase
+end
+
+
 
 
 function sort_ranking_results(
